@@ -65,12 +65,25 @@ class _McpSseConnection:
             self.alive = False
             return False
 
+# Unix domain sockets are unavailable on some platforms (Windows ships no
+# socket.AF_UNIX).  Guard class definitions so importing this module never
+# crashes there; the classes are only constructed via serve(unix_socket=...),
+# which now fails with a clear message on such platforms.
+_HAS_AF_UNIX = hasattr(socket, "AF_UNIX")
+
+
 class _UnixHTTPServerMixin:
     """Mixin that makes an HTTPServer subclass listen on a Unix domain socket."""
 
-    address_family = socket.AF_UNIX
+    if _HAS_AF_UNIX:
+        address_family = socket.AF_UNIX
 
     def server_bind(self):
+        if not _HAS_AF_UNIX:
+            raise RuntimeError(
+                "Unix domain sockets are not supported on this platform "
+                "(socket.AF_UNIX is unavailable). Use TCP host/port instead."
+            )
         if isinstance(self.server_address, str) and os.path.exists(self.server_address):
             os.unlink(self.server_address)
         # Skip HTTPServer.server_bind which unpacks (host, port) — that
@@ -456,6 +469,11 @@ class McpServer:
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
         if unix_socket:
+            if not _HAS_AF_UNIX:
+                raise RuntimeError(
+                    "Unix domain sockets are not supported on this platform. "
+                    "Use host/port TCP transport instead."
+                )
             server_cls = UnixThreadingHTTPServer if background else UnixHTTPServer
             server_address: str | tuple[str, int] = unix_socket
         else:

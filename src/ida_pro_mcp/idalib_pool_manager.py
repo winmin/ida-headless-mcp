@@ -34,6 +34,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# True when this platform supports Unix domain sockets.  On platforms without
+# socket.AF_UNIX (e.g. Windows), instances are spawned over TCP loopback
+# (127.0.0.1 + an auto-assigned ephemeral port) instead.
+HAS_AF_UNIX = hasattr(socket, "AF_UNIX")
+
+
+def _pick_free_port(host: str = "127.0.0.1") -> int:
+    """Reserve an ephemeral TCP port and return it for an instance to bind."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -66,6 +79,8 @@ class InstanceInfo:
     socket_path: str
     process: subprocess.Popen
     session_id: str | None = None  # None = idle
+    host: str = "127.0.0.1"        # TCP endpoint when AF_UNIX is unavailable
+    port: int | None = None        # None = Unix domain socket transport
 
 
 # ---------------------------------------------------------------------------
@@ -87,13 +102,24 @@ class InstanceManager:
 
     def spawn(self) -> InstanceInfo:
         idx = self._next_index
-        sock_path = os.path.join(self.socket_dir, f"{idx}.sock")
         log_path = os.path.join(self.socket_dir, f"{idx}.log")
-        cmd = [
-            sys.executable, "-m", "ida_pro_mcp.idalib_server",
-            "--unix-socket", sock_path,
-            *self.idalib_args,
-        ]
+        if HAS_AF_UNIX:
+            sock_path = os.path.join(self.socket_dir, f"{idx}.sock")
+            host, port = None, None
+            cmd = [
+                sys.executable, "-m", "ida_pro_mcp.idalib_server",
+                "--unix-socket", sock_path,
+                *self.idalib_args,
+            ]
+        else:
+            # No AF_UNIX (e.g. Windows): run the instance over TCP loopback
+            # on an OS-assigned ephemeral port instead of a Unix socket.
+            sock_path, host, port = "", "127.0.0.1", _pick_free_port()
+            cmd = [
+                sys.executable, "-m", "ida_pro_mcp.idalib_server",
+                "--host", host, "--port", str(port),
+                *self.idalib_args,
+            ]
         logger.info("Spawning instance %d: %s (log: %s)", idx, " ".join(cmd), log_path)
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
@@ -106,6 +132,8 @@ class InstanceManager:
             index=idx,
             socket_path=sock_path,
             process=proc,
+            host=host or "127.0.0.1",
+            port=port,
         )
         inst._log_file = log_file  # type: ignore[attr-defined]
         self._next_index += 1
@@ -152,16 +180,23 @@ class InstanceManager:
                     f"Instance {inst.index} exited prematurely "
                     f"(code {inst.process.returncode})"
                 )
-            if os.path.exists(inst.socket_path):
-                try:
+            try:
+                if inst.port is None:  # Unix domain socket transport
+                    if not os.path.exists(inst.socket_path):
+                        raise OSError("socket file not ready yet")
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(1)
                     sock.connect(inst.socket_path)
-                    sock.close()
-                    logger.info("Instance %d ready at %s", inst.index, inst.socket_path)
-                    return
-                except (ConnectionRefusedError, OSError):
-                    pass
+                else:  # TCP loopback fallback (no AF_UNIX on this platform)
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    sock.connect((inst.host, inst.port))
+                sock.close()
+                endpoint = inst.socket_path or f"{inst.host}:{inst.port}"
+                logger.info("Instance %d ready at %s", inst.index, endpoint)
+                return
+            except (ConnectionRefusedError, OSError):
+                pass
             time.sleep(0.2)
         raise TimeoutError(
             f"Instance {inst.index} did not become ready within {timeout}s"
@@ -184,10 +219,13 @@ class InstanceManager:
         return sc if sc is not None else result
 
     def forward_raw(self, inst: InstanceInfo, request: dict) -> dict:
-        conn = http.client.HTTPConnection("localhost", timeout=300)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(inst.socket_path)
-        conn.sock = sock
+        if inst.port is None:  # Unix domain socket transport
+            conn = http.client.HTTPConnection("localhost", timeout=300)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(inst.socket_path)
+            conn.sock = sock
+        else:  # TCP loopback fallback (no AF_UNIX on this platform)
+            conn = http.client.HTTPConnection(inst.host, inst.port, timeout=300)
         try:
             body = json.dumps(request)
             conn.request("POST", "/mcp", body, {"Content-Type": "application/json"})
